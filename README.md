@@ -1,5 +1,7 @@
 # libAsyncHttp Virion
 
+[![Poggit CI](https://poggit.pmmp.io/ci.shield/newlandpe/libAsyncHttp/libAsyncHttp)](https://poggit.pmmp.io/ci/newlandpe/libAsyncHttp/libAsyncHttp)
+
 `libAsyncHttp` is a modern, asynchronous HTTP client and a lightweight HTTP server library designed specifically for PocketMine-MP plugins. It enables seamless web integration, allowing your plugins to interact with external APIs and expose internal HTTP endpoints without blocking the main server thread.
 
 ## Features
