@@ -1,0 +1,11 @@
+---
+branches:
+- main
+projects:
+  libAsyncHttp:
+    path: ""
+    type: library
+    model: virion
+    libs:
+      - src: SOF3/await-generator/await-generator
+        version: ^3.0

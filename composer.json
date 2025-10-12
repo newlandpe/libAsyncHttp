@@ -1,0 +1,22 @@
+{
+    "name": "chernegasergiy/libasynchttp",
+    "description": "Asynchronous HTTP client and lightweight server for PocketMine-MP plugins",
+    "type": "library",
+    "license": "LicenseRef-CSSM-Unlimited-2.0",
+    "authors": [
+        {
+            "name": "Serhii Cherneha",
+            "email": "chernegasergiy3@gmail.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.0",
+        "pocketmine/pocketmine-mp": "^5.3.0",
+        "sof3/await-generator": "^3.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "ChernegaSergiy\\AsyncHttp\\": "src/ChernegaSergiy/AsyncHttp/"
+        }
+    }
+}

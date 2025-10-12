@@ -1,0 +1,5 @@
+name: libAsyncHttp
+author: ChernegaSergiy
+api: 5.0.0
+version: 0.1.0
+antigen: ChernegaSergiy\AsyncHttp
