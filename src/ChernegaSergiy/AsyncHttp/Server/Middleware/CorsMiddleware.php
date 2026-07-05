@@ -22,13 +22,13 @@ class CorsMiddleware implements MiddlewareInterface
         $this->maxAge = $maxAge;
     }
 
-    public function __invoke(Request $request, Response $response): void
+    public function process(Request $request, Response $response, callable $next): void
     {
         $origin = $request->getHeader('Origin');
 
         if ($origin !== null) {
-            if (in_array('*', $this->allowedOrigins) || in_array($origin, $this->allowedOrigins)) {
-                $response->setHeader('Access-Control-Allow-Origin', in_array('*', $this->allowedOrigins) ? '*' : $origin);
+            if (in_array('*', $this->allowedOrigins, true) || in_array($origin, $this->allowedOrigins, true)) {
+                $response->setHeader('Access-Control-Allow-Origin', in_array('*', $this->allowedOrigins, true) ? '*' : $origin);
             }
             $response->setHeader('Vary', 'Origin');
         }
@@ -38,8 +38,10 @@ class CorsMiddleware implements MiddlewareInterface
             $response->setHeader('Access-Control-Allow-Headers', implode(', ', $this->allowedHeaders));
             $response->setHeader('Access-Control-Max-Age', (string) $this->maxAge);
             $response->setStatus(204);
-            $response->send(''); // No content for OPTIONS request
+            $response->send('');
             return;
         }
+
+        $next($request, $response);
     }
 }
