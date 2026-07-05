@@ -16,10 +16,10 @@ class AuthMiddleware implements MiddlewareInterface
         $this->apiKey = $apiKey;
     }
 
-    public function __invoke(Request $request, Response $response): void
+    public function process(Request $request, Response $response, callable $next): void
     {
         $authHeader = $request->getHeader('Authorization');
-        
+
         if ($authHeader === null || !str_starts_with($authHeader, 'Bearer ')) {
             $response->setStatus(401);
             $response->json(['error' => 'Missing or invalid Authorization header']);
@@ -27,11 +27,13 @@ class AuthMiddleware implements MiddlewareInterface
         }
 
         $token = substr($authHeader, 7);
-        
-        if ($token !== $this->apiKey) {
+
+        if (!hash_equals($this->apiKey, $token)) {
             $response->setStatus(401);
             $response->json(['error' => 'Invalid API key']);
             return;
         }
+
+        $next($request, $response);
     }
 }
