@@ -9,5 +9,12 @@ use ChernegaSergiy\AsyncHttp\Server\Response;
 
 interface MiddlewareInterface
 {
-    public function __invoke(Request $request, Response $response): void;
+    /**
+     * Call $next($request, $response) to continue down the pipeline
+     * (Auth -> Cors -> Logger -> Handler). Do NOT call it to short-circuit
+     * the chain, e.g. after writing a 401 response.
+     *
+     * @param callable(Request, Response): void $next
+     */
+    public function process(Request $request, Response $response, callable $next): void;
 }
