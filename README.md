@@ -196,17 +196,19 @@ public function startWebServer(): void
   - `getBody()`: Gets the raw response body.
   - `json()`: Decodes the JSON response body into an array.
   - `isSuccess()`: Checks if the response status code indicates success (2xx).
-- **`ChernegaSergiy\AsyncHttp\Server\HttpServer`**: For creating an internal HTTP server.
+- **`ChernegaSergiy\AsyncHttp\Server\HttpServer`**: For creating an internal HTTP server. Runs entirely on the main thread via a repeating scheduler `Task` (see "Architecture" below) — it never uses `AsyncTask`.
   - `getRouter()`: Returns the `Router` instance for defining routes.
-  - `addMiddleware(callable $middleware)`: Adds a middleware function.
+  - `addMiddleware(MiddlewareInterface $middleware)`: Adds a middleware to the pipeline, in call order.
   - `start()`: Starts the HTTP server.
-  - `stop()`: Stops the HTTP server.
-- **`ChernegaSergiy\AsyncHttp\Server\Router`**: Manages HTTP routes for the server.
+  - `stop()`: Stops the HTTP server and closes all open connections.
+- **`ChernegaSergiy\AsyncHttp\Server\Router`**: Manages HTTP routes for the server. Supports `{param}` path segments.
   - `get(string $path, callable $handler)`: Defines a GET route.
   - `post(string $path, callable $handler)`: Defines a POST route.
   - `put(string $path, callable $handler)`: Defines a PUT route.
+  - `patch(string $path, callable $handler)`: Defines a PATCH route.
   - `delete(string $path, callable $handler)`: Defines a DELETE route.
   - `any(string $path, callable $handler)`: Defines a route for all common HTTP methods.
+  - Example: `$router->get('/users/{id}', fn(Request $r, Response $res) => $res->json(['id' => $r->getRouteParam('id')]));`
 - **`ChernegaSergiy\AsyncHttp\Server\Request`**: Represents an incoming HTTP request to the server.
   - `getMethod()`: Gets the HTTP method.
   - `getPath()`: Gets the request path.
@@ -224,6 +226,17 @@ public function startWebServer(): void
 - **`ChernegaSergiy\AsyncHttp\Server\Middleware\MiddlewareInterface`**: Interface for creating custom middleware.
 - **`ChernegaSergiy\AsyncHttp\Server\Middleware\AuthMiddleware`**: Example middleware for API key authentication.
 - **`ChernegaSergiy\AsyncHttp\Server\Middleware\CorsMiddleware`**: Example middleware for handling Cross-Origin Resource Sharing.
+
+## Architecture
+
+This matters if you're deciding whether to trust this library in production, so it's spelled out explicitly:
+
+- **`HttpClient`** dispatches each request as a `pocketmine\scheduler\AsyncTask` (`HttpRequestTask`). Only thread-safe scalars/arrays (method, URL, headers, body, timeout) are ever stored as task properties. The `resolve`/`reject` closures from `Await::promise()` never cross the thread boundary — they're kept on the main thread via `AsyncTask::storeLocal()`/`fetchLocal()`, which is the mechanism PocketMine provides specifically for this.
+- **`HttpServer`** does **not** use `AsyncTask` at all. An embedded HTTP listener is a long-lived accept/read/write loop, and `Router`, middleware, and the plugin logger all rely on closures and objects that can't be handed to a worker thread — and even if they could, `AsyncTask::onRun()` is meant to finish and report a single result, not run forever. Instead, `HttpServer` schedules a normal repeating `Task` (`ServerPollTask`) that runs on the main thread once per tick. Every socket call inside it (`accept`, `select`, `read`) uses a zero-second timeout, so a poll costs microseconds; requests are assembled incrementally across ticks by a small per-connection state machine (`ClientConnection`) that tracks `Content-Length` properly instead of doing a single fixed-size `fread()`.
+- **Middleware** implements `MiddlewareInterface::process(Request $request, Response $response, callable $next)`. Call `$next($request, $response)` to continue the chain (`Auth -> Cors -> ... -> Router::handle`); don't call it to short-circuit (e.g. after writing a 401).
+- **Routing** supports `{param}` path segments, compiled once per route into a regex (`CompiledRoute`), so `/users/{id}` matches `/users/15` and populates `$request->getRouteParam('id')`.
+
+Known limitations that are still open (contributions welcome): no `Transfer-Encoding: chunked` support, no keep-alive/streaming responses, and the client's retry logic is a simple fixed-attempt loop rather than exponential backoff.
 
 ## Contributing
 
