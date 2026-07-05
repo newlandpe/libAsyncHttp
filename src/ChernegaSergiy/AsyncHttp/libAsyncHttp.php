@@ -32,6 +32,14 @@ class libAsyncHttp
         return $this->client;
     }
 
+    /**
+     * Shortcut for $libAsyncHttp->getClient()->builder(...).
+     */
+    public function request(string $method, string $url): \ChernegaSergiy\AsyncHttp\Client\RequestBuilder
+    {
+        return $this->client->builder($method, $url);
+    }
+
     public function createServer(string $host = '0.0.0.0', int $port = 8080): HttpServer
     {
         $this->server = new HttpServer($this->plugin, $host, $port);
