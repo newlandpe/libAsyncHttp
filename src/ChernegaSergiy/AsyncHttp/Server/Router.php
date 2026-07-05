@@ -6,6 +6,7 @@ namespace ChernegaSergiy\AsyncHttp\Server;
 
 class Router
 {
+    /** @var array<string, CompiledRoute[]> method => list of compiled routes, checked in registration order */
     private array $routes = [];
 
     public function get(string $path, callable $handler): self
@@ -23,6 +24,11 @@ class Router
         return $this->addRoute('PUT', $path, $handler);
     }
 
+    public function patch(string $path, callable $handler): self
+    {
+        return $this->addRoute('PATCH', $path, $handler);
+    }
+
     public function delete(string $path, callable $handler): self
     {
         return $this->addRoute('DELETE', $path, $handler);
@@ -30,17 +36,18 @@ class Router
 
     public function any(string $path, callable $handler): self
     {
-        return $this->addRoute(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'], $path, $handler);
+        return $this->addRoute(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], $path, $handler);
     }
 
-    private function addRoute($methods, string $path, callable $handler): self
+    /**
+     * @param string|string[] $methods
+     */
+    private function addRoute(string|array $methods, string $path, callable $handler): self
     {
-        if (!is_array($methods)) {
-            $methods = [$methods];
-        }
+        $compiled = new CompiledRoute($path, $handler);
 
-        foreach ($methods as $method) {
-            $this->routes[$method][$this->normalizePath($path)] = $handler;
+        foreach (is_array($methods) ? $methods : [$methods] as $method) {
+            $this->routes[strtoupper($method)][] = $compiled;
         }
 
         return $this;
@@ -51,14 +58,19 @@ class Router
         $method = $request->getMethod();
         $path = $this->normalizePath($request->getPath());
 
-        if (!isset($this->routes[$method][$path])) {
-            $response->setStatus(404);
-            $response->json(['error' => 'Not Found']);
+        foreach ($this->routes[$method] ?? [] as $route) {
+            $params = $route->match($path);
+            if ($params === null) {
+                continue;
+            }
+
+            $request->setRouteParams($params);
+            ($route->getHandler())($request, $response);
             return;
         }
 
-        $handler = $this->routes[$method][$path];
-        $handler($request, $response);
+        $response->setStatus(404);
+        $response->json(['error' => 'Not Found']);
     }
 
     private function normalizePath(string $path): string
