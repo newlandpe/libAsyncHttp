@@ -5,26 +5,65 @@ declare(strict_types=1);
 namespace ChernegaSergiy\AsyncHttp\Server;
 
 use ChernegaSergiy\AsyncHttp\Exceptions\ServerException;
+use ChernegaSergiy\AsyncHttp\Server\Middleware\MiddlewareInterface;
 use pocketmine\plugin\PluginBase;
-use pocketmine\scheduler\AsyncTask;
-use pocketmine\Server;
+use pocketmine\scheduler\TaskHandler;
 
+/**
+ * A lightweight embedded HTTP server for PocketMine plugins (e.g. an OAuth
+ * 2.0 callback endpoint).
+ *
+ * Architecture note: this server does NOT use AsyncTask. AsyncTask exists
+ * for "run once on a worker, return a result", not for a long-lived socket
+ * server, and everything it would need to hold (a Router full of Closures,
+ * middleware callables, the plugin logger, the raw socket resource) is
+ * either non-serializable or simply not meant to leave the main thread.
+ *
+ * Instead, the accept/read/write loop is driven by a normal repeating
+ * scheduler Task (ServerPollTask) that runs on the main thread once per
+ * tick. Every socket call inside poll() uses a zero-timeout select/read, so
+ * it never blocks the server; connections are read incrementally across
+ * ticks and a proper Content-Length-aware state machine (ClientConnection)
+ * assembles the full request before dispatching it.
+ */
 class HttpServer
 {
     private PluginBase $plugin;
     private string $host;
     private int $port;
     private Router $router;
-    private ?int $serverSocket = null;
+
+    /** @var resource|null */
+    private $serverSocket = null;
     private bool $running = false;
+
+    /** @var MiddlewareInterface[] */
     private array $middlewares = [];
 
-    public function __construct(PluginBase $plugin, string $host = '0.0.0.0', int $port = 8080)
-    {
+    private ?TaskHandler $taskHandler = null;
+
+    /** @var array<int, ClientConnection> keyed by (int) socket */
+    private array $connections = [];
+
+    private int $connectionTimeoutSeconds;
+    private int $maxHeaderSize;
+    private int $maxBodySize;
+
+    public function __construct(
+        PluginBase $plugin,
+        string $host = '0.0.0.0',
+        int $port = 8080,
+        int $connectionTimeoutSeconds = 15,
+        int $maxHeaderSize = 16384,
+        int $maxBodySize = 1048576
+    ) {
         $this->plugin = $plugin;
         $this->host = $host;
         $this->port = $port;
         $this->router = new Router();
+        $this->connectionTimeoutSeconds = $connectionTimeoutSeconds;
+        $this->maxHeaderSize = $maxHeaderSize;
+        $this->maxBodySize = $maxBodySize;
     }
 
     public function getRouter(): Router
@@ -32,10 +71,15 @@ class HttpServer
         return $this->router;
     }
 
-    public function addMiddleware(callable $middleware): self
+    public function addMiddleware(MiddlewareInterface $middleware): self
     {
         $this->middlewares[] = $middleware;
         return $this;
+    }
+
+    public function isRunning(): bool
+    {
+        return $this->running;
     }
 
     public function start(): void
@@ -44,122 +88,180 @@ class HttpServer
             throw new ServerException('HTTP server is already running');
         }
 
-        $this->serverSocket = @stream_socket_server(
+        $socket = @stream_socket_server(
             "tcp://{$this->host}:{$this->port}",
             $errno,
             $errstr
         );
 
-        if ($this->serverSocket === false) {
+        if ($socket === false) {
             throw new ServerException("Failed to start HTTP server: {$errstr} ({$errno})");
         }
 
-        stream_set_blocking($this->serverSocket, false);
+        stream_set_blocking($socket, false);
+        $this->serverSocket = $socket;
         $this->running = true;
 
         $this->plugin->getLogger()->info("HTTP server started on {$this->host}:{$this->port}");
 
-        $this->scheduleServerTask();
+        // Runs on the main thread, once per tick. See ServerPollTask docblock.
+        $this->taskHandler = $this->plugin->getScheduler()->scheduleRepeatingTask(new ServerPollTask($this), 1);
     }
 
     public function stop(): void
     {
+        if (!$this->running) {
+            return;
+        }
+
+        $this->taskHandler?->cancel();
+        $this->taskHandler = null;
+
+        foreach ($this->connections as $connection) {
+            @fclose($connection->socket);
+        }
+        $this->connections = [];
+
         if ($this->serverSocket !== null) {
-            fclose($this->serverSocket);
+            @fclose($this->serverSocket);
             $this->serverSocket = null;
         }
+
         $this->running = false;
-        $this->plugin->getLogger()->info("HTTP server stopped");
+        $this->plugin->getLogger()->info('HTTP server stopped');
     }
 
-    private function scheduleServerTask(): void
+    /**
+     * Called by ServerPollTask every tick. Never blocks: accept and
+     * stream_select both use a 0-second timeout, and reads only consume
+     * whatever is already buffered by the OS.
+     */
+    public function poll(): void
     {
-        if (!$this->running) return;
+        if (!$this->running || $this->serverSocket === null) {
+            return;
+        }
 
-        $this->plugin->getScheduler()->scheduleAsyncTask(
-            new class($this->serverSocket, $this->router, $this->middlewares, $this->plugin->getLogger()) extends AsyncTask {
-                private $socket;
-                private Router $router;
-                private array $middlewares;
-                private \ThreadedLogger $logger;
+        while (($client = @stream_socket_accept($this->serverSocket, 0)) !== false) {
+            stream_set_blocking($client, false);
+            $this->connections[(int) $client] = new ClientConnection($client);
+        }
 
-                public function __construct($socket, Router $router, array $middlewares, \ThreadedLogger $logger)
-                {
-                    $this->socket = $socket;
-                    $this->router = $router;
-                    $this->middlewares = $middlewares;
-                    $this->logger = $logger;
-                }
+        $this->reapTimedOutConnections();
 
-                public function onRun(): void
-                {
-                    $sockets = [$this->socket];
-                    $write = [];
-                    $except = [];
-                    $timeout = 1;
+        if (empty($this->connections)) {
+            return;
+        }
 
-                    while (!empty($sockets)) {
-                        $read = $sockets;
-                        $numChanged = @stream_select($read, $write, $except, $timeout);
+        $read = [];
+        foreach ($this->connections as $id => $connection) {
+            $read[$id] = $connection->socket;
+        }
+        $write = [];
+        $except = [];
 
-                        if ($numChanged === false) {
-                            break;
-                        }
+        $changed = @stream_select($read, $write, $except, 0);
+        if ($changed === false || $changed === 0) {
+            return;
+        }
 
-                        if ($numChanged > 0) {
-                            foreach ($read as $socket) {
-                                if ($socket === $this->socket) {
-                                    // New connection
-                                    $clientSocket = @stream_socket_accept($this->socket, 0);
-                                    if ($clientSocket !== false) {
-                                        $sockets[] = $clientSocket;
-                                        stream_set_blocking($clientSocket, false);
-                                    }
-                                } else {
-                                    // Existing connection
-                                    $requestData = @fread($socket, 8192);
-                                    
-                                    if ($requestData === false || $requestData === '' || feof($socket)) {
-                                        // Connection closed
-                                        fclose($socket);
-                                        $sockets = array_filter($sockets, fn($s) => $s !== $socket);
-                                        continue;
-                                    }
+        foreach ($read as $id => $socket) {
+            $this->handleReadable($id);
+        }
+    }
 
-                                    try {
-                                        $request = Request::fromRawData($requestData);
-                                        $response = new Response();
+    private function reapTimedOutConnections(): void
+    {
+        if (empty($this->connections)) {
+            return;
+        }
 
-                                        // Apply middlewares
-                                        foreach ($this->middlewares as $middleware) {
-                                            $middleware($request, $response);
-                                            if ($response->isSent()) break;
-                                        }
-
-                                        if (!$response->isSent()) {
-                                            $this->router->handle($request, $response);
-                                        }
-
-                                        fwrite($socket, $response->buildResponse());
-                                    } catch (\Throwable $e) {
-                                        $errorResponse = new Response();
-                                        $errorResponse->setStatus(500);
-                                        $errorResponse->json([
-                                            'error' => 'Internal Server Error',
-                                            'message' => $e->getMessage()
-                                        ]);
-                                        fwrite($socket, $errorResponse->buildResponse());
-                                    }
-
-                                    fclose($socket);
-                                    $sockets = array_filter($sockets, fn($s) => $s !== $socket);
-                                }
-                            }
-                        }
-                    }
-                }
+        $now = microtime(true);
+        foreach ($this->connections as $id => $connection) {
+            if ($now - $connection->connectedAt > $this->connectionTimeoutSeconds) {
+                $this->respondAndClose($connection, 408, 'Request Timeout', ['error' => 'Request Timeout']);
+                unset($this->connections[$id]);
             }
-        );
+        }
+    }
+
+    private function handleReadable(int $id): void
+    {
+        $connection = $this->connections[$id] ?? null;
+        if ($connection === null) {
+            return;
+        }
+
+        $chunk = @fread($connection->socket, 65536);
+
+        if ($chunk === false || ($chunk === '' && feof($connection->socket))) {
+            @fclose($connection->socket);
+            unset($this->connections[$id]);
+            return;
+        }
+
+        $connection->buffer .= $chunk;
+
+        if (!$connection->headersComplete) {
+            $headerEndPos = strpos($connection->buffer, "\r\n\r\n");
+
+            if ($headerEndPos === false) {
+                if (strlen($connection->buffer) > $this->maxHeaderSize) {
+                    $this->respondAndClose($connection, 431, 'Request Header Fields Too Large', ['error' => 'Request Header Fields Too Large']);
+                    unset($this->connections[$id]);
+                }
+                return;
+            }
+
+            $headerBlob = substr($connection->buffer, 0, $headerEndPos);
+            [$connection->method, $connection->path, $connection->protocol, $connection->headers] = Request::parseHeaderBlob($headerBlob);
+            $connection->headersComplete = true;
+            $connection->headerEnd = $headerEndPos + 4;
+            $connection->contentLength = (int) ($connection->headers['content-length'] ?? 0);
+
+            if ($connection->contentLength > $this->maxBodySize) {
+                $this->respondAndClose($connection, 413, 'Payload Too Large', ['error' => 'Payload Too Large']);
+                unset($this->connections[$id]);
+                return;
+            }
+        }
+
+        if ($connection->isComplete()) {
+            $this->dispatch($connection);
+            @fclose($connection->socket);
+            unset($this->connections[$id]);
+        }
+    }
+
+    private function dispatch(ClientConnection $connection): void
+    {
+        $request = new Request($connection->method, $connection->path, $connection->headers, $connection->getBody(), $connection->protocol);
+        $response = new Response();
+
+        try {
+            $pipeline = new MiddlewarePipeline($this->middlewares, function (Request $request, Response $response): void {
+                $this->router->handle($request, $response);
+            });
+            $pipeline->handle($request, $response);
+        } catch (\Throwable $e) {
+            $response = new Response();
+            $response->setStatus(500);
+            $response->json([
+                'error' => 'Internal Server Error',
+                'message' => $e->getMessage(),
+            ]);
+        }
+
+        @fwrite($connection->socket, $response->buildResponse());
+    }
+
+    private function respondAndClose(ClientConnection $connection, int $status, string $reason, array $payload): void
+    {
+        $response = new Response();
+        $response->setStatus($status);
+        $response->json($payload);
+        @fwrite($connection->socket, $response->buildResponse());
+        @fclose($connection->socket);
     }
 
     public function __destruct()
