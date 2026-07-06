@@ -65,12 +65,22 @@ class Response
         $statusText = $this->getStatusText($this->statusCode);
         $headers = ["HTTP/1.1 {$this->statusCode} {$statusText}"];
 
+        $hasConnectionHeader = false;
         foreach ($this->headers as $name => $value) {
+            if (strtolower($name) === 'connection') {
+                $hasConnectionHeader = true;
+            }
             $headers[] = "{$name}: {$value}";
         }
 
-        $headers[] = "Content-Length: " . strlen($this->body);
-        $headers[] = "Connection: close";
+        $headers[] = 'Content-Length: ' . strlen($this->body);
+
+        // Callers (HttpServer) are expected to set Connection explicitly
+        // based on Keep-Alive negotiation. Default to "close" only when
+        // nobody set it, so Response stays safe to use standalone too.
+        if (!$hasConnectionHeader) {
+            $headers[] = 'Connection: close';
+        }
 
         return implode("\r\n", $headers) . "\r\n\r\n" . $this->body;
     }
