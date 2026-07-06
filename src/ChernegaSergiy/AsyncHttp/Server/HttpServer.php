@@ -22,9 +22,24 @@ use pocketmine\scheduler\TaskHandler;
  * Instead, the accept/read/write loop is driven by a normal repeating
  * scheduler Task (ServerPollTask) that runs on the main thread once per
  * tick. Every socket call inside poll() uses a zero-timeout select/read, so
- * it never blocks the server; connections are read incrementally across
- * ticks and a proper Content-Length-aware state machine (ClientConnection)
- * assembles the full request before dispatching it.
+ * it never blocks the server.
+ *
+ * Each connection goes through three phases (see ClientConnection):
+ *
+ *   READING -> (headers + Content-Length-aware body assembly)
+ *       |
+ *       v
+ *   DISPATCH (middleware pipeline + router, synchronous, main thread)
+ *       |
+ *       v
+ *   WRITING -> fwrite() is attempted every tick until writeBuffer is fully
+ *              flushed (non-blocking sockets can accept fewer bytes than
+ *              requested in a single call, so partial writes are tracked
+ *              via writeOffset instead of being silently dropped)
+ *       |
+ *       v
+ *   Connection: keep-alive -> reset -> back to READING
+ *   Connection: close      -> fclose()
  */
 class HttpServer
 {
@@ -48,6 +63,7 @@ class HttpServer
     private int $connectionTimeoutSeconds;
     private int $maxHeaderSize;
     private int $maxBodySize;
+    private int $maxKeepAliveRequests;
 
     public function __construct(
         PluginBase $plugin,
@@ -55,7 +71,8 @@ class HttpServer
         int $port = 8080,
         int $connectionTimeoutSeconds = 15,
         int $maxHeaderSize = 16384,
-        int $maxBodySize = 1048576
+        int $maxBodySize = 1048576,
+        int $maxKeepAliveRequests = 100
     ) {
         $this->plugin = $plugin;
         $this->host = $host;
@@ -64,6 +81,7 @@ class HttpServer
         $this->connectionTimeoutSeconds = $connectionTimeoutSeconds;
         $this->maxHeaderSize = $maxHeaderSize;
         $this->maxBodySize = $maxBodySize;
+        $this->maxKeepAliveRequests = $maxKeepAliveRequests;
     }
 
     public function getRouter(): Router
@@ -132,9 +150,10 @@ class HttpServer
     }
 
     /**
-     * Called by ServerPollTask every tick. Never blocks: accept and
-     * stream_select both use a 0-second timeout, and reads only consume
-     * whatever is already buffered by the OS.
+     * Called by ServerPollTask every tick. Never blocks: accept, select and
+     * fwrite all either use a 0-second timeout or are inherently
+     * non-blocking, and reads/writes only move whatever the OS already has
+     * buffered.
      */
     public function poll(): void
     {
@@ -148,6 +167,7 @@ class HttpServer
         }
 
         $this->reapTimedOutConnections();
+        $this->flushPendingWrites();
 
         if (empty($this->connections)) {
             return;
@@ -155,11 +175,17 @@ class HttpServer
 
         $read = [];
         foreach ($this->connections as $id => $connection) {
-            $read[$id] = $connection->socket;
+            if ($connection->state === ClientConnection::STATE_READING) {
+                $read[$id] = $connection->socket;
+            }
         }
+
+        if (empty($read)) {
+            return;
+        }
+
         $write = [];
         $except = [];
-
         $changed = @stream_select($read, $write, $except, 0);
         if ($changed === false || $changed === 0) {
             return;
@@ -170,6 +196,53 @@ class HttpServer
         }
     }
 
+    /**
+     * Attempts to flush any connection currently in the WRITING phase.
+     * Safe to call unconditionally every tick: fwrite() on a non-blocking
+     * socket returns immediately, and we only advance writeOffset by
+     * however many bytes it actually accepted.
+     */
+    private function flushPendingWrites(): void
+    {
+        foreach ($this->connections as $id => $connection) {
+            if ($connection->state !== ClientConnection::STATE_WRITING) {
+                continue;
+            }
+
+            $remaining = substr($connection->writeBuffer, $connection->writeOffset);
+            if ($remaining === '') {
+                $this->finishWrite($id, $connection);
+                continue;
+            }
+
+            $written = @fwrite($connection->socket, $remaining);
+
+            if ($written === false) {
+                @fclose($connection->socket);
+                unset($this->connections[$id]);
+                continue;
+            }
+
+            $connection->writeOffset += $written;
+            $connection->lastActivityAt = microtime(true);
+
+            if ($connection->writeOffset >= strlen($connection->writeBuffer)) {
+                $this->finishWrite($id, $connection);
+            }
+        }
+    }
+
+    private function finishWrite(int $id, ClientConnection $connection): void
+    {
+        if ($connection->keepAliveAfterWrite && $connection->requestsHandled + 1 < $this->maxKeepAliveRequests) {
+            $connection->resetForNextRequest();
+            return;
+        }
+
+        @fclose($connection->socket);
+        unset($this->connections[$id]);
+    }
+
     private function reapTimedOutConnections(): void
     {
         if (empty($this->connections)) {
@@ -178,8 +251,22 @@ class HttpServer
 
         $now = microtime(true);
         foreach ($this->connections as $id => $connection) {
-            if ($now - $connection->connectedAt > $this->connectionTimeoutSeconds) {
-                $this->respondAndClose($connection, 408, 'Request Timeout', ['error' => 'Request Timeout']);
+            if ($connection->state !== ClientConnection::STATE_READING) {
+                continue;
+            }
+
+            if ($now - $connection->lastActivityAt > $this->connectionTimeoutSeconds) {
+                if ($connection->readBuffer === '' && $connection->requestsHandled > 0) {
+                    // An idle Keep-Alive connection that simply never sent
+                    // another request: nothing to respond to, just drop it.
+                    @fclose($connection->socket);
+                } else {
+                    // A request started (any bytes received) but never
+                    // completed in time — this deserves an actual response,
+                    // whether it's the very first request on this
+                    // connection or a later one on a Keep-Alive socket.
+                    $this->writeErrorAndClose($connection, 408, 'Request Timeout', ['error' => 'Request Timeout']);
+                }
                 unset($this->connections[$id]);
             }
         }
@@ -188,7 +275,7 @@ class HttpServer
     private function handleReadable(int $id): void
     {
         $connection = $this->connections[$id] ?? null;
-        if ($connection === null) {
+        if ($connection === null || $connection->state !== ClientConnection::STATE_READING) {
             return;
         }
 
@@ -200,36 +287,39 @@ class HttpServer
             return;
         }
 
-        $connection->buffer .= $chunk;
+        if ($chunk === '') {
+            return;
+        }
+
+        $connection->readBuffer .= $chunk;
+        $connection->lastActivityAt = microtime(true);
 
         if (!$connection->headersComplete) {
-            $headerEndPos = strpos($connection->buffer, "\r\n\r\n");
+            $headerEndPos = strpos($connection->readBuffer, "\r\n\r\n");
 
             if ($headerEndPos === false) {
-                if (strlen($connection->buffer) > $this->maxHeaderSize) {
-                    $this->respondAndClose($connection, 431, 'Request Header Fields Too Large', ['error' => 'Request Header Fields Too Large']);
+                if (strlen($connection->readBuffer) > $this->maxHeaderSize) {
+                    $this->writeErrorAndClose($connection, 431, 'Request Header Fields Too Large', ['error' => 'Request Header Fields Too Large']);
                     unset($this->connections[$id]);
                 }
                 return;
             }
 
-            $headerBlob = substr($connection->buffer, 0, $headerEndPos);
+            $headerBlob = substr($connection->readBuffer, 0, $headerEndPos);
             [$connection->method, $connection->path, $connection->protocol, $connection->headers] = Request::parseHeaderBlob($headerBlob);
             $connection->headersComplete = true;
             $connection->headerEnd = $headerEndPos + 4;
             $connection->contentLength = (int) ($connection->headers['content-length'] ?? 0);
 
             if ($connection->contentLength > $this->maxBodySize) {
-                $this->respondAndClose($connection, 413, 'Payload Too Large', ['error' => 'Payload Too Large']);
+                $this->writeErrorAndClose($connection, 413, 'Payload Too Large', ['error' => 'Payload Too Large']);
                 unset($this->connections[$id]);
                 return;
             }
         }
 
-        if ($connection->isComplete()) {
+        if ($connection->isRequestComplete()) {
             $this->dispatch($connection);
-            @fclose($connection->socket);
-            unset($this->connections[$id]);
         }
     }
 
@@ -252,13 +342,33 @@ class HttpServer
             ]);
         }
 
-        @fwrite($connection->socket, $response->buildResponse());
+        $keepAlive = $this->shouldKeepAlive($request);
+        $response->setHeader('Connection', $keepAlive ? 'keep-alive' : 'close');
+
+        $connection->beginWrite($response->buildResponse(), $keepAlive);
     }
 
-    private function respondAndClose(ClientConnection $connection, int $status, string $reason, array $payload): void
+    private function shouldKeepAlive(Request $request): bool
+    {
+        $connectionHeader = strtolower($request->getHeader('Connection') ?? '');
+
+        if ($connectionHeader === 'close') {
+            return false;
+        }
+
+        if ($connectionHeader === 'keep-alive') {
+            return true;
+        }
+
+        // HTTP/1.1 defaults to persistent connections; HTTP/1.0 defaults to close.
+        return $request->getProtocol() === 'HTTP/1.1';
+    }
+
+    private function writeErrorAndClose(ClientConnection $connection, int $status, string $reason, array $payload): void
     {
         $response = new Response();
         $response->setStatus($status);
+        $response->setHeader('Connection', 'close');
         $response->json($payload);
         @fwrite($connection->socket, $response->buildResponse());
         @fclose($connection->socket);
