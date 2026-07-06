@@ -233,10 +233,25 @@ This matters if you're deciding whether to trust this library in production, so 
 
 - **`HttpClient`** dispatches each request as a `pocketmine\scheduler\AsyncTask` (`HttpRequestTask`). Only thread-safe scalars/arrays (method, URL, headers, body, timeout) are ever stored as task properties. The `resolve`/`reject` closures from `Await::promise()` never cross the thread boundary — they're kept on the main thread via `AsyncTask::storeLocal()`/`fetchLocal()`, which is the mechanism PocketMine provides specifically for this.
 - **`HttpServer`** does **not** use `AsyncTask` at all. An embedded HTTP listener is a long-lived accept/read/write loop, and `Router`, middleware, and the plugin logger all rely on closures and objects that can't be handed to a worker thread — and even if they could, `AsyncTask::onRun()` is meant to finish and report a single result, not run forever. Instead, `HttpServer` schedules a normal repeating `Task` (`ServerPollTask`) that runs on the main thread once per tick. Every socket call inside it (`accept`, `select`, `read`) uses a zero-second timeout, so a poll costs microseconds; requests are assembled incrementally across ticks by a small per-connection state machine (`ClientConnection`) that tracks `Content-Length` properly instead of doing a single fixed-size `fread()`.
-- **Middleware** implements `MiddlewareInterface::process(Request $request, Response $response, callable $next)`. Call `$next($request, $response)` to continue the chain (`Auth -> Cors -> ... -> Router::handle`); don't call it to short-circuit (e.g. after writing a 401).
+- **Middleware** implements `MiddlewareInterface::process(Request $request, Response $response, callable $next)`. Call `$next($request, $response)` to continue the chain (`Auth -> Cors -> ... -> Router::handle`); don't call it to short-circuit (e.g. after writing a 401). Note: this is onion-style — code *after* the `$next()` call in an outer middleware still runs on unwind even if an inner middleware short-circuits; only the downstream call chain is skipped.
 - **Routing** supports `{param}` path segments, compiled once per route into a regex (`CompiledRoute`), so `/users/{id}` matches `/users/15` and populates `$request->getRouteParam('id')`.
+- **Writes and Keep-Alive**: responses are written through a `writeBuffer`/`writeOffset` pair on `ClientConnection` (see the READ -> DISPATCH -> WRITE phases in `HttpServer`'s docblock) instead of a single `fwrite()` call, so a large response isn't silently truncated if a non-blocking socket accepts fewer bytes than requested. Once a response is fully flushed, the connection either closes (`Connection: close`) or resets and goes back to reading the next request on the same socket (`Connection: keep-alive`, the HTTP/1.1 default), bounded by a `maxKeepAliveRequests` cap per connection.
 
-Known limitations that are still open (contributions welcome): no `Transfer-Encoding: chunked` support, no keep-alive/streaming responses, and the client's retry logic is a simple fixed-attempt loop rather than exponential backoff.
+Known limitations that are still open (contributions welcome): no `Transfer-Encoding: chunked` support for request/response bodies, and the client's retry logic is a simple fixed-attempt loop rather than exponential backoff.
+
+## Testing
+
+```bash
+composer install
+composer test
+```
+
+63 tests covering routing (including `{param}` matching), the middleware
+pipeline, request/response parsing, the `HttpClient` thread-safety wiring,
+and real-socket integration tests for `HttpServer` (fragmented reads,
+`Content-Length` edge cases, timeouts, disconnects, large responses,
+Keep-Alive, and concurrent clients). See `tests/README.md` for details on
+how PocketMine dependencies are stubbed for testing.
 
 ## Contributing
 
